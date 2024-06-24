@@ -1,0 +1,128 @@
+# SCN Mikrotik rb5009 config
+# rb5009 with lte (via dhcp) backhaul
+#
+# Everything below here is unfishied and untested
+
+:global sitecode {{ site_code }}
+:global noderole {{ node_role }}
+:global vpnuser {{ ovpn_user }}
+:global vpnpass {{ ovpn_password }}
+
+:global nodename ("SCN-" . sitecode ."-". noderole)
+
+# TODO: See if we want to generate node numbers like nycmesh
+:global adminmac ([/interface get ether2 mac-address])
+
+/delay 15
+
+/interface bridge add admin-mac=$adminmac auto-mac=no comment=defconf name=bridge port-cost-mode=short
+/interface ethernet set [ find default-name=ether1 ] comment="WAN to LTE modem"
+/interface list add comment=defconf name=WAN
+/interface list add comment=defconf name=LAN
+/interface wireless security-profiles set [ find default=yes ] supplicant-identity=MikroTik
+
+# TODO custom dns options for ubnt and cloudflare dns for user dhcp dns servers...
+# /ip dhcp-server option sets add name=unifi-local-dns options=""
+/ip pool add name=dhcp ranges=10.100.0.10-10.100.0.254
+/ip dhcp-server add address-pool=dhcp interface=bridge lease-time=10m name=defconf
+
+/ppp profile add change-tcp-mss=yes name=OVPN-client only-one=yes use-encryption=required use-mpls=no
+# NB: mac-address auto-generated for ovpn-client
+/interface ovpn-client add certificate=client-ml.crt_0 cipher=aes256-cbc connect-to=jumpbox.seattlecommunitynetwork.org name=scn-vpn password=$vpnpass profile=OVPN-client user=$vpnuser
+
+/queue type add cake-autorate-ingress=yes cake-nat=yes kind=cake name=cake-default
+/queue tree add max-limit=1600M name=cake-upload packet-mark=pmark-cake parent=ether1 queue=cake-default
+/queue tree add max-limit=1600M name=cake-download packet-mark=pmark-cake parent=bridge queue=cake-default
+
+/snmp community set [ find default=yes ] addresses=10.0.1.12/32,172.16.20.161/32 name=seattlecommunitynetwork
+
+/interface bridge port add bridge=bridge comment=defconf interface=ether2 internal-path-cost=10 path-cost=10
+/interface bridge port add bridge=bridge comment=defconf interface=ether3 internal-path-cost=10 path-cost=10
+/interface bridge port add bridge=bridge comment=defconf interface=ether4 internal-path-cost=10 path-cost=10
+/interface bridge port add bridge=bridge comment=defconf interface=ether5 internal-path-cost=10 path-cost=10
+/interface bridge port add bridge=bridge comment=defconf interface=ether6 internal-path-cost=10 path-cost=10
+/interface bridge port add bridge=bridge comment=defconf interface=ether7 internal-path-cost=10 path-cost=10
+/interface bridge port add bridge=bridge comment=defconf interface=ether8 internal-path-cost=10 path-cost=10
+/interface bridge port add bridge=bridge comment=defconf interface=sfp-sfpplus1 internal-path-cost=10 path-cost=10
+
+/ip firewall connection tracking set udp-timeout=10s
+/ip neighbor discovery-settings set discover-interface-list=LAN
+
+/interface list member add comment=defconf interface=bridge list=LAN
+/interface list member add comment=defconf interface=ether1 list=WAN
+
+/ip address add address=10.100.0.1/24 comment=defconf interface=bridge network=10.100.0.0
+/ip dhcp-client add comment=defconf interface=ether1
+/ip dhcp-server network add address=10.100.0.0/24 comment=defconf dns-server=10.100.0.1 gateway=10.100.0.1 netmask=24
+
+/ip dns set allow-remote-requests=yes servers=1.1.1.1,1.0.0.1
+/ip dns static add address=10.100.0.1 comment=defconf name=router.lan
+/ip dns static add cname=unifi.seattlecommunitynetwork.org comment="This is SCN Cloud Controller" name=unifi. type=CNAME
+
+/ip firewall filter add action=accept chain=input comment="defconf: accept established,related,untracked" connection-state=established,related,untracked
+/ip firewall filter add action=drop chain=input comment="defconf: drop invalid" connection-state=invalid
+/ip firewall filter add action=accept chain=input comment="defconf: accept ICMP" protocol=icmp
+/ip firewall filter add action=accept chain=input comment="defconf: accept to local loopback (for CAPsMAN)" dst-address=127.0.0.1
+/ip firewall filter add action=accept chain=input comment="scn vpn" in-interface=scn-vpn
+/ip firewall filter add action=drop chain=input comment="defconf: drop all not coming from LAN" in-interface-list=!LAN
+/ip firewall filter add action=accept chain=forward comment="defconf: accept in ipsec policy" ipsec-policy=in,ipsec
+/ip firewall filter add action=accept chain=forward comment="defconf: accept out ipsec policy" ipsec-policy=out,ipsec
+/ip firewall filter add action=fasttrack-connection chain=forward comment="defconf: fasttrack; disabled for LTE queuing" connection-state=established,related disabled=yes hw-offload=yes
+/ip firewall filter add action=accept chain=forward comment="defconf: accept established,related, untracked" connection-state=established,related,untracked
+/ip firewall filter add action=drop chain=forward comment="defconf: drop invalid" connection-state=invalid
+/ip firewall filter add action=drop chain=forward comment="Drop traffic to the LTE web-ui not coming from the SCN VPN for now" dst-address=192.168.225.0/24 in-interface=!scn-vpn out-interface=ether1
+/ip firewall filter add action=drop chain=forward comment="defconf: drop all from WAN not DSTNATed" connection-nat-state=!dstnat connection-state=new in-interface-list=WAN
+/ip firewall mangle add action=mark-connection chain=forward comment="Mark WAN for CAKE QoS" connection-mark=no-mark in-interface=ether1 new-connection-mark=cake_conn
+/ip firewall mangle add action=mark-connection chain=forward comment="Mark WAN for CAKE QoS" connection-mark=no-mark new-connection-mark=cake_conn out-interface=ether1 out-interface-list=none
+/ip firewall mangle add action=mark-packet chain=forward comment="Mark for CAKE traffic shaper/scheduler" connection-mark=cake_conn new-packet-mark=pmark-cake
+/ip firewall nat add action=masquerade chain=srcnat comment="defconf: masquerade" ipsec-policy=out,none out-interface-list=WAN
+
+/ip service set www-ssl disabled=no
+/ip ssh set forwarding-enabled=local host-key-type=ed25519 strong-crypto=yes
+
+/ipv6 firewall address-list add address=::/128 comment="defconf: unspecified address" list=bad_ipv6
+/ipv6 firewall address-list add address=::1/128 comment="defconf: lo" list=bad_ipv6
+/ipv6 firewall address-list add address=fec0::/10 comment="defconf: site-local" list=bad_ipv6
+/ipv6 firewall address-list add address=::ffff:0.0.0.0/96 comment="defconf: ipv4-mapped" list=bad_ipv6
+/ipv6 firewall address-list add address=::/96 comment="defconf: ipv4 compat" list=bad_ipv6
+/ipv6 firewall address-list add address=100::/64 comment="defconf: discard only " list=bad_ipv6
+/ipv6 firewall address-list add address=2001:db8::/32 comment="defconf: documentation" list=bad_ipv6
+/ipv6 firewall address-list add address=2001:10::/28 comment="defconf: ORCHID" list=bad_ipv6
+/ipv6 firewall address-list add address=3ffe::/16 comment="defconf: 6bone" list=bad_ipv6
+/ipv6 firewall filter add action=accept chain=input comment="defconf: accept established,related,untracked" connection-state=established,related,untracked
+/ipv6 firewall filter add action=drop chain=input comment="defconf: drop invalid" connection-state=invalid
+/ipv6 firewall filter add action=accept chain=input comment="defconf: accept ICMPv6" protocol=icmpv6
+/ipv6 firewall filter add action=accept chain=input comment="defconf: accept UDP traceroute" port=33434-33534 protocol=udp
+/ipv6 firewall filter add action=accept chain=input comment="defconf: accept DHCPv6-Client prefix delegation." dst-port=546 protocol=udp src-address=fe80::/10
+/ipv6 firewall filter add action=accept chain=input comment="defconf: accept IKE" dst-port=500,4500 protocol=udp
+/ipv6 firewall filter add action=accept chain=input comment="defconf: accept ipsec AH" protocol=ipsec-ah
+/ipv6 firewall filter add action=accept chain=input comment="defconf: accept ipsec ESP" protocol=ipsec-esp
+/ipv6 firewall filter add action=accept chain=input comment="defconf: accept all that matches ipsec policy" ipsec-policy=in,ipsec
+/ipv6 firewall filter add action=drop chain=input comment="defconf: drop everything else not coming from LAN" in-interface-list=!LAN
+/ipv6 firewall filter add action=accept chain=forward comment="defconf: accept established,related,untracked" connection-state=established,related,untracked
+/ipv6 firewall filter add action=drop chain=forward comment="defconf: drop invalid" connection-state=invalid
+/ipv6 firewall filter add action=drop chain=forward comment="defconf: drop packets with bad src ipv6" src-address-list=bad_ipv6
+/ipv6 firewall filter add action=drop chain=forward comment="defconf: drop packets with bad dst ipv6" dst-address-list=bad_ipv6
+/ipv6 firewall filter add action=drop chain=forward comment="defconf: rfc4890 drop hop-limit=1" hop-limit=equal:1 protocol=icmpv6
+/ipv6 firewall filter add action=accept chain=forward comment="defconf: accept ICMPv6" protocol=icmpv6
+/ipv6 firewall filter add action=accept chain=forward comment="defconf: accept HIP" protocol=139
+/ipv6 firewall filter add action=accept chain=forward comment="defconf: accept IKE" dst-port=500,4500 protocol=udp
+/ipv6 firewall filter add action=accept chain=forward comment="defconf: accept ipsec AH" protocol=ipsec-ah
+/ipv6 firewall filter add action=accept chain=forward comment="defconf: accept ipsec ESP" protocol=ipsec-esp
+/ipv6 firewall filter add action=accept chain=forward comment="defconf: accept all that matches ipsec policy" ipsec-policy=in,ipsec
+/ipv6 firewall filter add action=drop chain=forward comment="defconf: drop everything else not coming from LAN" in-interface-list=!LAN
+
+/snmp set contact=lcl@seattlecommunitynetwork.org enabled=yes location=$sitecode
+
+/system clock set time-zone-name=America/Los_Angeles
+/system identity set name=$nodename
+/system note set show-at-login=no
+
+/tool graphing set store-every=hour
+/tool graphing interface add allow-address=10.0.0.0/8 interface=ether1 store-on-disk=no
+/tool graphing resource add allow-address=10.0.0.0/8 store-on-disk=no
+
+/tool mac-server set allowed-interface-list=LAN
+/tool mac-server mac-winbox set allowed-interface-list=LAN
+
+:blink;
